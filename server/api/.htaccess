@@ -1,0 +1,13 @@
+Options -Indexes
+
+# Route all API requests through index.php
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^(.*)$ index.php [QSA,L]
+
+# Security: block direct access to data directory
+RewriteRule ^../data/ - [F,L]
+
+# PHP settings
+php_flag display_errors Off
+php_value error_log ../data/php_errors.log
