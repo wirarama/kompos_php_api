@@ -1,13 +1,76 @@
-Options -Indexes
+# ═══════════════════════════════════════════════════════════
+#  KomposIoT PHP API — Apache .htaccess
+#  Security-hardened configuration
+# ═══════════════════════════════════════════════════════════
 
-# Route all API requests through index.php
+Options -Indexes -ExecCGI -Includes
+ServerSignature Off
+
+# ── Routing ────────────────────────────────────────────────
 RewriteEngine On
+
+# Block access to security data folder
+RewriteRule ^/?data/         - [F,L]
+RewriteRule ^/?security/     - [F,L]
+
+# Block sensitive files
+RewriteRule \.(json|sqlite|log|sh|env|ini|bak|sql)$ - [F,L]
+
+# Route all requests through index.php
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteRule ^(.*)$ index.php [QSA,L]
 
-# Security: block direct access to data directory
-RewriteRule ^../data/ - [F,L]
+# ── PHP Security Settings ───────────────────────────────────
+php_flag  display_errors         Off
+php_flag  log_errors             On
+php_value error_log              ../data/php_errors.log
+php_flag  allow_url_fopen        Off
+php_flag  allow_url_include      Off
+php_flag  expose_php             Off
+php_value post_max_size          16K
+php_value upload_max_filesize    1K
+php_value max_execution_time     15
+php_value memory_limit           32M
 
-# PHP settings
-php_flag display_errors Off
-php_value error_log ../data/php_errors.log
+# ── HTTP Security Headers ───────────────────────────────────
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options    "nosniff"
+    Header always set X-Frame-Options           "DENY"
+    Header always set X-XSS-Protection          "1; mode=block"
+    Header always set Referrer-Policy           "no-referrer"
+    Header always set Content-Security-Policy   "default-src 'none'"
+    Header always set Cache-Control             "no-store, no-cache"
+    Header always unset X-Powered-By
+    Header always unset Server
+</IfModule>
+
+# ── Block Bad Bots & Scanners ───────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteCond %{HTTP_USER_AGENT} (nikto|sqlmap|nmap|masscan|zgrab|libwww-perl|python-urllib|scrapy) [NC]
+    RewriteRule .* - [F,L]
+
+    # Block empty User-Agent on non-IoT endpoints (optional — disable if needed)
+    # RewriteCond %{HTTP_USER_AGENT} ^$
+    # RewriteRule .* - [F,L]
+</IfModule>
+
+# ── Block Common Attack Paths ───────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteCond %{REQUEST_URI} (wp-admin|wp-login|phpMyAdmin|\.env|\.git|backup|shell|cmd|xmlrpc) [NC]
+    RewriteRule .* - [F,L]
+</IfModule>
+
+# ── Rate Limiting via mod_evasive (if installed) ────────────
+<IfModule mod_evasive24.c>
+    DOSHashTableSize    3097
+    DOSPageCount        5
+    DOSSiteCount        50
+    DOSPageInterval     1
+    DOSSiteInterval     1
+    DOSBlockingPeriod   10
+</IfModule>
+
+# ── Limit HTTP Methods ──────────────────────────────────────
+<LimitExcept GET POST DELETE OPTIONS HEAD>
+    Deny from all
+</LimitExcept>
