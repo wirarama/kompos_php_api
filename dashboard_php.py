@@ -48,7 +48,6 @@ st.set_page_config(
 )
 
 # ── Default server (PHP API) ──────────────────────────────────────
-DEFAULT_SERVER = "http://localhost/kompos/api"
 DEFAULT_APIKEY = "kompos2024iot"
 
 FASE_DEF = {
@@ -65,6 +64,16 @@ SENSOR_OPTS = {
     "moisture": {"label": "Kelembapan (%)",  "color": "#38BDF8", "unit": "%"},
     "gas":      {"label": "Gas (ppm)",        "color": "#86EFAC", "unit": "ppm"},
 }
+
+# ── Color helper: convert #RRGGBB hex + alpha to rgba() ──────────
+def hex_to_rgba(hex_color: str, alpha: float = 1.0) -> str:
+    """Convert #RRGGBB string + alpha float to Plotly-compatible rgba() string."""
+    h = hex_color.lstrip('#')
+    if len(h) == 6:
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return hex_color  # fallback unchanged
+
 
 # ══════════════════════════════════════════════════════════════════
 # CSS
@@ -192,6 +201,145 @@ def api_health(base: str) -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# DB HEALTH CHECK
+# ══════════════════════════════════════════════════════════════════
+def check_db_health(base: str, key: str) -> dict:
+    """Cek apakah database PHP sudah terbentuk dan bisa ditulis."""
+    result = {
+        "server_online": False,
+        "db_exists": False,
+        "db_writable": False,
+        "total_records": 0,
+        "last_record": None,
+        "error": None,
+    }
+    try:
+        # 1. server online?
+        r = requests.get(f"{base}/health.php", timeout=4)
+        if r.status_code != 200:
+            result["error"] = f"Server HTTP {r.status_code}"
+            return result
+        result["server_online"] = True
+        health = r.json()
+        result["db_exists"] = health.get("db_path") == "exists"
+
+        # 2. status (total records)
+        r2 = requests.get(f"{base}/status.php",
+                          headers=get_headers(key), timeout=4)
+        if r2.status_code == 200:
+            st_data = r2.json()
+            result["total_records"] = st_data.get("total_records", 0)
+            result["last_record"]   = st_data.get("latest")
+
+        # 3. write test — kirim satu data dummy & cek id bertambah
+        test_payload = {
+            "device_id": "__db_test__",
+            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "suhu": 25.0, "moisture": 50.0, "gas": 100.0,
+            "api_key": key,
+        }
+        r3 = requests.post(f"{base}/data.php",
+                           headers=get_headers(key),
+                           json=test_payload, timeout=6)
+        if r3.status_code in (200, 201):
+            resp3 = r3.json()
+            if resp3.get("id"):
+                result["db_writable"] = True
+                result["test_id"]     = resp3["id"]
+        elif r3.status_code == 401:
+            result["error"] = "Auth gagal — cek API key"
+        else:
+            result["error"] = f"Write test HTTP {r3.status_code}"
+
+    except requests.exceptions.ConnectionError:
+        result["error"] = "Connection refused — pastikan server.py / PHP berjalan"
+    except requests.exceptions.Timeout:
+        result["error"] = "Timeout — server lambat merespons"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# UI SIMULATION HELPERS
+# ══════════════════════════════════════════════════════════════════
+FASE_PROFIL_SIM = {
+    0: {"nama":"Mesophilik Awal",    "suhu":(20,38),  "moisture":(62,75), "gas":(40,90)},
+    1: {"nama":"Termofilik Aktif",   "suhu":(38,65),  "moisture":(48,68), "gas":(90,280)},
+    2: {"nama":"Puncak Dekomposisi", "suhu":(52,70),  "moisture":(36,52), "gas":(280,580)},
+    3: {"nama":"Pendinginan",        "suhu":(28,55),  "moisture":(38,54), "gas":(120,480)},
+    4: {"nama":"Maturasi",           "suhu":(24,35),  "moisture":(38,52), "gas":(45,160)},
+    5: {"nama":"Kompos Matang",      "suhu":(18,28),  "moisture":(34,50), "gas":(20,90)},
+}
+
+def sim_sensor(lo, hi, noise=0.05):
+    import random
+    base   = random.uniform(lo, hi)
+    jitter = base * noise * random.gauss(0, 1)
+    return round(max(lo*0.9, min(hi*1.1, base+jitter)), 2)
+
+def run_ui_simulation(base: str, key: str, device_id: str,
+                      fase_ids: list, n_per_fase: int,
+                      delay_ms: int, progress_placeholder,
+                      log_placeholder) -> list:
+    """Kirim data simulasi dari UI dan kembalikan log hasil."""
+    import random, time as _time
+    random.seed()
+    results = []
+    logs    = []
+    total   = len(fase_ids) * n_per_fase
+    done    = 0
+    base_dt = datetime.now() - timedelta(days=42)
+
+    for fase_id in fase_ids:
+        p = FASE_PROFIL_SIM[fase_id]
+        emoji = FASE_DEF[fase_id]["emoji"]
+        for s in range(n_per_fase):
+            suhu    = sim_sensor(*p["suhu"])
+            moisture= sim_sensor(*p["moisture"])
+            gas     = sim_sensor(*p["gas"])
+            ts      = (base_dt + timedelta(
+                        days=fase_id*6 + s*(6/max(n_per_fase-1,1)),
+                        hours=random.uniform(0,23))
+                      ).strftime("%Y-%m-%dT%H:%M:%S")
+
+            payload = {
+                "device_id": device_id,
+                "timestamp": ts,
+                "suhu": suhu, "moisture": moisture, "gas": gas,
+                "api_key": key,
+            }
+            try:
+                r   = requests.post(f"{base}/data.php",
+                                    headers=get_headers(key),
+                                    json=payload, timeout=6)
+                ok  = r.status_code in (200, 201)
+                an  = r.json().get("analysis", {}) if ok else {}
+                ikk = an.get("ikk", 0)
+                fname = an.get("fase_nama", "?")
+                log   = (f"{emoji} F{fase_id} #{s+1:02d}  "
+                         f"T={suhu:.1f}°C M={moisture:.1f}% G={gas:.0f}ppm  "
+                         f"→ {'✅' if ok else '❌'}  "
+                         f"IKK={ikk:.1f}  [{fname}]")
+            except Exception as e:
+                ok  = False
+                log = f"❌ F{fase_id} #{s+1:02d} ERROR: {e}"
+
+            logs.append(log)
+            results.append({"fase": fase_id, "ok": ok})
+            done += 1
+            progress_placeholder.progress(done / total,
+                text=f"Mengirim {done}/{total} sampel...")
+            log_placeholder.code("\n".join(logs[-20:]))   # tampilkan 20 baris terakhir
+            if delay_ms > 0:
+                _time.sleep(delay_ms / 1000)
+
+    return results
 
 
 def send_manual(base: str, key: str, payload: dict):
@@ -377,8 +525,8 @@ def phase_shading(fig, df: pd.DataFrame, rows=None):
         if f != prev:
             if prev is not None:
                 kwargs = dict(x0=start, x1=row["timestamp"],
-                              fillcolor=FASE_DEF[prev]["warna"],
-                              opacity=0.08, layer="below", line_width=0)
+                              fillcolor=hex_to_rgba(FASE_DEF[prev]["warna"], 0.08),
+                              opacity=1.0, layer="below", line_width=0)
                 if rows:
                     for r in rows:
                         fig.add_vrect(row=r, col=1, **kwargs)
@@ -590,10 +738,10 @@ with tab1:
                 "bar":  {"color": ikk_color(ikk_v), "thickness": 0.25},
                 "bgcolor": "rgba(0,0,0,0)", "borderwidth": 0,
                 "steps": [
-                    {"range": [0,  40], "color": "#7F1D1D33"},
-                    {"range": [40, 60], "color": "#78350F33"},
-                    {"range": [60, 80], "color": "#14532D33"},
-                    {"range": [80,100], "color": "#15803D33"},
+                    {"range": [0,  40], "color": "rgba(127,29,29,0.2)"},
+                    {"range": [40, 60], "color": "rgba(120,53,15,0.2)"},
+                    {"range": [60, 80], "color": "rgba(20,83,45,0.2)"},
+                    {"range": [80,100], "color": "rgba(21,128,61,0.2)"},
                 ],
             },
         ))
@@ -631,7 +779,7 @@ with tab1:
                 fig_mini.add_trace(go.Scatter(
                     x=df_2h["timestamp"], y=df_2h[col],
                     mode="lines", line=dict(color=color, width=2),
-                    fill="tozeroy", fillcolor=color+"22",
+                    fill="tozeroy", fillcolor=hex_to_rgba(color, 0.13),
                     showlegend=False,
                 ), row=1, col=ci)
         fig_mini.update_layout(**PLOTLY_LAYOUT, height=200)
@@ -678,7 +826,7 @@ with tab2:
                 fig.add_trace(go.Scatter(
                     x=df_tr["timestamp"], y=df_tr[col],
                     mode="lines", line=dict(color=color,width=1.8),
-                    fill="tozeroy", fillcolor=color+"18",
+                    fill="tozeroy", fillcolor=hex_to_rgba(color, 0.09),
                     name=SENSOR_OPTS[col]["label"],
                 ), row=ri, col=1)
 
@@ -686,7 +834,7 @@ with tab2:
             fig.add_trace(go.Scatter(
                 x=df_tr["timestamp"], y=df_tr["ikk"],
                 mode="lines", line=dict(color="#FCD34D",width=2),
-                fill="tozeroy", fillcolor="#FCD34D18",
+                fill="tozeroy", fillcolor="rgba(252,211,77,0.09)",
                 name="IKK",
             ), row=4, col=1)
             for thr, tc in [(80,"#22C55E"),(60,"#F59E0B"),(40,"#EF4444")]:
@@ -761,12 +909,12 @@ with tab3:
             cs = df_sp[col]
             fig_s.add_trace(go.Scatter(
                 x=df_sp["timestamp"], y=cs.clip(lower=0),
-                fill="tozeroy", fillcolor="#22C55E18",
+                fill="tozeroy", fillcolor="rgba(34,197,94,0.09)",
                 line=dict(width=0), showlegend=False,
             ), row=ri, col=1)
             fig_s.add_trace(go.Scatter(
                 x=df_sp["timestamp"], y=cs.clip(upper=0),
-                fill="tozeroy", fillcolor="#EF444418",
+                fill="tozeroy", fillcolor="rgba(239,68,68,0.09)",
                 line=dict(width=0), showlegend=False,
             ), row=ri, col=1)
             fig_s.add_trace(go.Scatter(
@@ -1213,14 +1361,14 @@ with tab5:
                 fig_agg.add_trace(go.Scatter(
                     x=pd.concat([x, x[::-1]]),
                     y=pd.concat([mu+std, (mu-std)[::-1]]),
-                    fill="toself", fillcolor=color+"25",
+                    fill="toself", fillcolor=hex_to_rgba(color, 0.15),
                     line=dict(width=0), name="μ±σ", showlegend=(ri==1),
                 ), row=ri, col=1)
                 # min-max band
                 fig_agg.add_trace(go.Scatter(
                     x=pd.concat([x, x[::-1]]),
                     y=pd.concat([mx, mn[::-1]]),
-                    fill="toself", fillcolor=color+"10",
+                    fill="toself", fillcolor=hex_to_rgba(color, 0.06),
                     line=dict(width=0), name="min-max", showlegend=(ri==1),
                 ), row=ri, col=1)
                 fig_agg.add_trace(go.Scatter(
@@ -1327,56 +1475,134 @@ with tab5:
 
 
 # ══════════════════════════════════════════════════════════════════
-# TAB 6 — KONFIGURASI
+# TAB 6 — KONFIGURASI + DB CHECK + UI SIMULATION
 # ══════════════════════════════════════════════════════════════════
 with tab6:
-    st.markdown("### ⚙️ Konfigurasi & Tools")
-    c6a, c6b = st.columns(2)
+    st.markdown("### ⚙️ Konfigurasi, Database Health & Simulasi UI")
 
-    with c6a:
-        st.markdown("#### 🔌 Endpoint Referensi")
-        st.code(f"""
-# Base URL
-{server_base}
+    sub1, sub2, sub3 = st.tabs(["🗄️ Database & Server", "🎮 Simulasi UI", "📋 Referensi API"])
 
-# Endpoints
-POST  {server_base}/data.php
-GET   {server_base}/latest.php?device_id={device_id}
-GET   {server_base}/history.php?hours=24&limit=500
-GET   {server_base}/aggregate.php?level=hourly&days=7
-GET   {server_base}/status.php
-GET   {server_base}/health.php
-DEL   {server_base}/reset.php
-""", language="text")
+    # ── SUB-TAB 1: DB Health + Server Status ──────────────────────
+    with sub1:
+        st.markdown("#### 🗄️ Database Health Check")
+        st.caption("Cek apakah database PHP sudah terbentuk, bisa dibaca, dan bisa ditulis.")
 
-        st.markdown("#### 📦 Contoh JSON Request")
-        st.code(json.dumps({
-            "device_id": device_id,
-            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "suhu": 54.3, "moisture": 48.2, "gas": 185.6,
-            "api_key": api_key,
-        }, indent=2), language="json")
+        col_db1, col_db2 = st.columns([1, 2])
+        with col_db1:
+            run_check = st.button("🔍 Jalankan Health Check", use_container_width=True,
+                                  type="primary")
+        with col_db2:
+            st.info("Health check akan mengirim **1 data dummy** ke `/api/data.php` "
+                    "untuk memverifikasi database writable.")
 
-    with c6b:
-        st.markdown("#### 📊 Status Server")
-        if st.button("🔍 Refresh Status", use_container_width=True):
-            st.cache_data.clear()
+        if run_check:
+            with st.spinner("Mengecek server dan database..."):
+                health = check_db_health(server_base, api_key)
+
+            # Result cards
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                icon = "🟢" if health["server_online"] else "🔴"
+                color = "#22C55E" if health["server_online"] else "#EF4444"
+                st.markdown(f"""
+                <div class="metric-card" style="border-color:{color}">
+                  <div class="metric-value" style="color:{color};font-size:1.8rem">
+                    {icon} {"Online" if health["server_online"] else "Offline"}
+                  </div>
+                  <div class="metric-label">Server PHP API</div>
+                  <div class="metric-sub">{server_base}</div>
+                </div>""", unsafe_allow_html=True)
+
+            with r2:
+                icon2 = "🟢" if health["db_exists"] else "🔴"
+                color2 = "#22C55E" if health["db_exists"] else "#EF4444"
+                st.markdown(f"""
+                <div class="metric-card" style="border-color:{color2}">
+                  <div class="metric-value" style="color:{color2};font-size:1.8rem">
+                    {icon2} {"Exists" if health["db_exists"] else "Not Found"}
+                  </div>
+                  <div class="metric-label">Database SQLite</div>
+                  <div class="metric-sub">kompos.sqlite</div>
+                </div>""", unsafe_allow_html=True)
+
+            with r3:
+                icon3 = "🟢" if health["db_writable"] else "🔴"
+                color3 = "#22C55E" if health["db_writable"] else "#EF4444"
+                st.markdown(f"""
+                <div class="metric-card" style="border-color:{color3}">
+                  <div class="metric-value" style="color:{color3};font-size:1.8rem">
+                    {icon3} {"Writable" if health["db_writable"] else "Not Writable"}
+                  </div>
+                  <div class="metric-label">DB Write Test</div>
+                  <div class="metric-sub">
+                    {"ID: " + str(health.get("test_id","?")) if health["db_writable"]
+                     else "Gagal menulis data"}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("")
+
+            # Detail panel
+            if health["error"]:
+                st.error(f"❌ **Error:** {health['error']}")
+                with st.expander("💡 Solusi"):
+                    st.markdown("""
+**Server offline / Connection refused:**
+```bash
+# Jalankan PHP server (XAMPP/Laragon) atau:
+php -S localhost:8080 -t /path/to/kompos/
+```
+
+**DB tidak exists / not writable:**
+```bash
+# Pastikan folder data/ writable
+mkdir -p /var/www/html/kompos/data/
+chmod 775 /var/www/html/kompos/data/
+chown www-data:www-data /var/www/html/kompos/data/
+```
+
+**Auth gagal (401):**
+```python
+# Samakan API_KEY di config.php dan di sidebar dashboard
+define('API_KEY', 'kompos2024iot');
+```
+""")
+            else:
+                col_det1, col_det2 = st.columns(2)
+                with col_det1:
+                    st.success(f"✅ Total rekaman: **{health['total_records']}** baris")
+                with col_det2:
+                    if health.get("last_record"):
+                        lr = health["last_record"]
+                        st.info(f"📌 Data terakhir: **{lr.get('device_id','?')}** "
+                                f"@ {lr.get('timestamp','?')[:19]}")
+
+                if health["db_writable"] and health.get("test_id"):
+                    st.success(
+                        f"✅ Database sehat — write test berhasil (record ID: {health['test_id']})"
+                    )
+
+        st.divider()
+        st.markdown("#### 📊 Status Server Detail")
+        col_s1, col_s2 = st.columns([1, 3])
+        with col_s1:
+            if st.button("🔄 Refresh Status", use_container_width=True):
+                st.cache_data.clear()
         status = api_status(server_base, api_key)
         if status:
-            st.json(status)
+            # Ringkasan
+            rs1, rs2, rs3 = st.columns(3)
+            rs1.metric("Total Records", status.get("total_records", "?"))
+            rs2.metric("PHP Version",   status.get("php_version", "?"))
+            rs3.metric("Devices",       len(status.get("devices", [])))
+            with st.expander("📋 Full JSON Status"):
+                st.json(status)
         else:
-            st.error("Server tidak dapat dijangkau")
+            st.error("Server tidak dapat dijangkau.")
 
-        st.markdown("#### 🧪 Test Koneksi")
-        if st.button("📡 Ping Server", use_container_width=True):
-            online = api_health(server_base)
-            if online:
-                st.success("✅ Server online dan berjalan")
-            else:
-                st.error("❌ Server tidak merespons")
-
-        with st.expander("⚠️ Reset Database", expanded=False):
-            st.warning("Menghapus SEMUA data sensor dan mereset SPRT state!")
+        st.divider()
+        with st.expander("⚠️ Reset Database (Development Only)", expanded=False):
+            st.warning("Menghapus **SEMUA** data sensor dan mereset SPRT state!")
             if st.button("🗑️ Reset Database", type="primary",
                          use_container_width=True):
                 try:
@@ -1387,6 +1613,182 @@ DEL   {server_base}/reset.php
                         st.success(f"✅ {r.json().get('message','Reset OK')}")
                         st.rerun()
                     else:
-                        st.error(f"Error {r.status_code}")
+                        st.error(f"Error {r.status_code}: {r.text}")
                 except Exception as e:
                     st.error(f"❌ {e}")
+
+    # ── SUB-TAB 2: UI SIMULATION ───────────────────────────────────
+    with sub2:
+        st.markdown("#### 🎮 Simulasi Pengiriman Data dari UI")
+        st.caption(
+            "Kirim data sintetis langsung dari browser ke PHP server — "
+            "tanpa menjalankan `simulasi_php.py` di terminal."
+        )
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown("**Konfigurasi Simulasi**")
+            sim_device  = st.text_input("Device ID Simulasi", value="D1R32_UI_SIM")
+            sim_n       = st.slider("Sampel per fase", 2, 30, 5)
+            sim_delay   = st.slider("Delay antar kirim (ms)", 0, 2000, 200, 50)
+
+            # Pilih fase yang akan disimulasikan
+            sim_fases   = st.multiselect(
+                "Fase yang disimulasikan",
+                options=list(range(6)),
+                default=list(range(6)),
+                format_func=lambda x: f"{FASE_DEF[x]['emoji']} {FASE_DEF[x]['nama']}",
+            )
+
+        with sc2:
+            st.markdown("**Preview Nilai Sensor per Fase**")
+            for fid in (sim_fases if sim_fases else list(range(6))):
+                p     = FASE_PROFIL_SIM[fid]
+                finfo = FASE_DEF[fid]
+                st.markdown(
+                    f"<div style='background:{finfo['warna']}15;"
+                    f"border-left:3px solid {finfo['warna']};"
+                    f"padding:5px 10px;border-radius:4px;margin:3px 0;"
+                    f"font-size:0.82rem;color:#D8E4F0;'>"
+                    f"{finfo['emoji']} <b>{finfo['nama']}</b> — "
+                    f"🌡 {p['suhu'][0]}–{p['suhu'][1]}°C &nbsp;"
+                    f"💧 {p['moisture'][0]}–{p['moisture'][1]}% &nbsp;"
+                    f"🌫 {p['gas'][0]}–{p['gas'][1]} ppm"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        total_sim = len(sim_fases) * sim_n if sim_fases else 0
+        st.markdown(
+            f"**Total yang akan dikirim: "
+            f"<span style='color:#22C55E;font-size:1.2rem'>{total_sim}</span> sampel**",
+            unsafe_allow_html=True,
+        )
+
+        if not sim_fases:
+            st.warning("Pilih minimal 1 fase untuk disimulasikan.")
+        else:
+            start_sim = st.button(
+                f"▶️ Mulai Simulasi — {total_sim} sampel",
+                type="primary", use_container_width=True,
+            )
+
+            if start_sim:
+                # First check server
+                if not api_health(server_base):
+                    st.error("❌ Server tidak online. Nyalakan server PHP terlebih dahulu.")
+                else:
+                    st.markdown("---")
+                    st.markdown("**📡 Log Pengiriman**")
+                    progress_ph = st.empty()
+                    log_ph      = st.empty()
+                    result_ph   = st.empty()
+
+                    with st.spinner("Simulasi berjalan..."):
+                        results = run_ui_simulation(
+                            server_base, api_key, sim_device,
+                            sim_fases, sim_n, sim_delay,
+                            progress_ph, log_ph,
+                        )
+
+                    progress_ph.progress(1.0, text="✅ Selesai!")
+
+                    n_ok   = sum(1 for r in results if r["ok"])
+                    n_fail = len(results) - n_ok
+
+                    if n_ok == len(results):
+                        result_ph.success(
+                            f"✅ Simulasi selesai — {n_ok}/{len(results)} berhasil dikirim. "
+                            f"Refresh tab **Live Monitor** atau **Tren Sensor** untuk melihat data."
+                        )
+                    elif n_ok > 0:
+                        result_ph.warning(
+                            f"⚠️ Sebagian berhasil: {n_ok} sukses, {n_fail} gagal."
+                        )
+                    else:
+                        result_ph.error("❌ Semua pengiriman gagal. Cek koneksi server.")
+
+                    # Per-fase summary
+                    from collections import Counter
+                    fase_counts = Counter(r["fase"] for r in results if r["ok"])
+                    if fase_counts:
+                        st.markdown("**Rekap per Fase:**")
+                        cols_sum = st.columns(len(sim_fases))
+                        for i, fid in enumerate(sim_fases):
+                            cnt   = fase_counts.get(fid, 0)
+                            finfo = FASE_DEF[fid]
+                            with cols_sum[i]:
+                                st.markdown(
+                                    f"<div style='text-align:center;"
+                                    f"background:{finfo['warna']}20;"
+                                    f"border:1px solid {finfo['warna']};"
+                                    f"border-radius:8px;padding:8px;'>"
+                                    f"<div style='font-size:1.3rem'>{finfo['emoji']}</div>"
+                                    f"<div style='font-size:0.9rem;font-weight:700;"
+                                    f"color:{finfo['warna']}'>{cnt}/{sim_n}</div>"
+                                    f"<div style='font-size:0.7rem;color:#94A3B8'>"
+                                    f"{finfo['nama'].split()[0]}</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                    st.cache_data.clear()  # refresh all cached API data
+
+    # ── SUB-TAB 3: API Reference ───────────────────────────────────
+    with sub3:
+        st.markdown("#### 🔌 Endpoint Referensi")
+        st.code(
+            f"# PHP REST API Base URL\n"
+            f"BASE = {server_base}\n\n"
+            f"# Endpoints\n"
+            f"POST   {server_base}/data.php       # Kirim data sensor\n"
+            f"GET    {server_base}/latest.php     # Data terbaru\n"
+            f"GET    {server_base}/history.php    # Riwayat (hours, limit)\n"
+            f"GET    {server_base}/aggregate.php  # Agregasi (level, days)\n"
+            f"GET    {server_base}/status.php     # Status + SPRT state\n"
+            f"GET    {server_base}/health.php     # Health check\n"
+            f"DELETE {server_base}/reset.php      # Reset DB (dev only)\n",
+            language="bash",
+        )
+
+        st.markdown("#### 📦 Format JSON Request")
+        st.code(json.dumps({
+            "device_id" : device_id,
+            "timestamp" : datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "suhu"      : 54.3,
+            "moisture"  : 48.2,
+            "gas"       : 185.6,
+            "api_key"   : api_key,
+        }, indent=2), language="json")
+
+        st.markdown("#### ✅ Format Response 201")
+        st.code(json.dumps({
+            "id": 42, "status": "ok",
+            "analysis": {
+                "fase_pred": 1,
+                "fase_nama": "Termofilik Aktif",
+                "ikk": 72.4,
+                "sprt": {"cusum_t": 1.23, "cusum_m": 0.45, "cusum_g": 2.11},
+            },
+            "alerts": [],
+            "recommendation": "Semua parameter dalam kondisi normal.",
+        }, indent=2), language="json")
+
+        st.markdown("#### 🛡️ Autentikasi")
+        st.code(
+            "# Via Header (direkomendasikan untuk firmware)\n"
+            "curl -H \"X-API-Key: kompos2024iot\" ...\n\n"
+            "# Via JSON body field\n"
+            '{"api_key": "kompos2024iot", "suhu": 54.3, ...}',
+            language="bash",
+        )
+
+        st.markdown("#### 📡 Test dengan curl")
+        st.code(
+            f"curl -X POST {server_base}/data.php \\\n"
+            f"  -H \"Content-Type: application/json\" \\\n"
+            f"  -H \"X-API-Key: {api_key}\" \\\n"
+            f"  -d '{{\"device_id\":\"{device_id}\"," 
+            f"\"timestamp\":\"$(date -Iseconds)\"," 
+            f"\"suhu\":54.3,\"moisture\":48.2,\"gas\":185.6}}'",
+            language="bash",
+        )
