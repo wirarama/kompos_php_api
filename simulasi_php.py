@@ -23,7 +23,7 @@ from collections import Counter
 # ════════════════════════════════════════════════════════════
 # KONFIGURASI
 # ════════════════════════════════════════════════════════════
-SERVER_BASE   = "http://localhost/kompos/api"  # Ganti dengan IP/domain server
+SERVER_BASE   = "https://wedashwara.com/kompos"  # Ganti dengan IP/domain server
 API_KEY       = "kompos2024iot"                # Harus sama dengan config.php
 DEVICE_ID     = "D1R32_SIM"                   # ID perangkat simulasi
 DEVICE_LOC    = "Bak Kompos A"

@@ -48,6 +48,7 @@ st.set_page_config(
 )
 
 # ── Default server (PHP API) ──────────────────────────────────────
+DEFAULT_SERVER = "https://wedashwara.com/kompos"
 DEFAULT_APIKEY = "kompos2024iot"
 
 FASE_DEF = {
@@ -745,8 +746,16 @@ with tab1:
                 ],
             },
         ))
-        fig_g.update_layout(**PLOTLY_LAYOUT, height=200,
-                             margin=dict(l=10,r=10,t=30,b=10))
+        PLOTLY_LAYOUT = {
+            "template": "plotly_white",
+            "font": dict(size=12)
+        }
+
+        fig_g.update_layout(
+            **PLOTLY_LAYOUT,
+            height=200,
+            margin=dict(l=10, r=10, t=30, b=10)
+        )
         st.plotly_chart(fig_g, use_container_width=True,
                         config={"displayModeBar": False})
 
